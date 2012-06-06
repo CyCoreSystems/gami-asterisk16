@@ -87,7 +87,9 @@ type Asterisk struct {
 	Writer        io.Writer                // all messages from asterisk will come there if Debug is true
 	ch            chan string              // channel for interacting between read and parse goroutine
 	callbacks     map[string]func(Message) // map for callback functions
+	cMutex        *sync.RWMutex            // mutex for callbacks
 	eventHandlers map[string]func(Message) // map for event callbacks
+	eMutex        *sync.RWMutex            // mutex for events
 	hostname      string                   // hostname stored for generate ActionID
 	id            int                      // integer indentificator for action
 }
@@ -119,32 +121,30 @@ func parseMessage(s []string) (m Message) {
 // updateActionCallback, add, remove or update callback for action
 // if c == nil will remove callback, otherways replace or add
 func (a *Asterisk) updateActionCallback(key string, c func(Message)) {
-	
-	s := &sync.RWMutex{}
-	s.Lock()
-	defer s.Unlock()
-	
+
+	a.cMutex.Lock()
+	defer a.cMutex.Unlock()
+
 	if c == nil {
 		delete(a.callbacks, key)
 		return
 	}
-	
+
 	a.callbacks[key] = c
 }
 
 // updateEventCallback, add, remove or update callback for event
 func (a *Asterisk) updateEventCallback(key string, c func(Message)) {
-	
-	s := &sync.RWMutex{}
-	s.Lock()
 
-	defer s.Unlock()
-		
+	a.eMutex.Lock()
+
+	defer a.eMutex.Unlock()
+
 	if c == nil {
 		delete(a.eventHandlers, key)
 		return
 	}
-	
+
 	a.eventHandlers[key] = c
 }
 
@@ -154,6 +154,8 @@ func (a *Asterisk) Handle() (err error) {
 	a.ch = make(chan string, 20)
 	a.callbacks = make(map[string]func(Message))
 	a.eventHandlers = make(map[string]func(Message))
+	a.cMutex = &sync.RWMutex{}
+	a.eMutex = &sync.RWMutex{}
 
 	quit := make(chan int)
 
@@ -235,10 +237,10 @@ func (a *Asterisk) send(p string) (err error) {
 
 	p += T
 	_, err = fmt.Fprintf(a.C, p)
-    
-    if err != nil {
-        panic(err)
-    }
+
+	if err != nil {
+		panic(err)
+	}
 
 	return
 }
@@ -250,7 +252,7 @@ func (a *Asterisk) generateId() (id string) {
 	s := sync.RWMutex{}
 	s.Lock()
 	defer s.Unlock()
-	
+
 	a.id++
 	return
 }
