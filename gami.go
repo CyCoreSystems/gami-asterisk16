@@ -66,6 +66,7 @@ import (
 	"net"
 	"os"
 	"strings"
+	"sync"
 )
 
 const (
@@ -113,6 +114,38 @@ func parseMessage(s []string) (m Message) {
 	}
 
 	return
+}
+
+// updateActionCallback, add, remove or update callback for action
+// if c == nil will remove callback, otherways replace or add
+func (a *Asterisk) updateActionCallback(key string, c func(Message)) {
+	
+	s := &sync.RWMutex{}
+	s.Lock()
+	defer s.Unlock()
+	
+	if c == nil {
+		delete(a.callbacks, key)
+		return
+	}
+	
+	a.callbacks[key] = c
+}
+
+// updateEventCallback, add, remove or update callback for event
+func (a *Asterisk) updateEventCallback(key string, c func(Message)) {
+	
+	s := &sync.RWMutex{}
+	s.Lock()
+
+	defer s.Unlock()
+		
+	if c == nil {
+		delete(a.eventHandlers, key)
+		return
+	}
+	
+	a.eventHandlers[key] = c
 }
 
 // Handle, preparing gami for working with Asterisk
@@ -166,7 +199,7 @@ func (a *Asterisk) Handle() (err error) {
 
 					if f, ok := a.callbacks[m["ActionID"]]; ok {
 						f(m)
-						delete(a.callbacks, m["ActionID"])
+						a.updateActionCallback(m["ActionID"], nil)
 					}
 
 					if v, vok := m["Event"]; vok {
@@ -214,6 +247,10 @@ func (a *Asterisk) send(p string) (err error) {
 func (a *Asterisk) generateId() (id string) {
 
 	id = a.hostname + "-" + fmt.Sprint(a.id)
+	s := sync.RWMutex{}
+	s.Lock()
+	defer s.Unlock()
+	
 	a.id++
 	return
 }
@@ -230,12 +267,11 @@ func (a *Asterisk) SendAction(p map[string]string, c func(Message)) {
 
 	}
 
-	if _, ok := a.callbacks[p["ActionID"]]; !ok && c != nil { // if no callback and argument callback
-		a.callbacks[p["ActionID"]] = c // not nil will add to execute (not replace exists)
+	if c != nil {
+		a.updateActionCallback(p["ActionID"], c)
 	}
 
 	for k, v := range p {
-
 		cmd += k + ":" + v + T
 	}
 
@@ -251,7 +287,7 @@ func (a *Asterisk) Login(user string, password string, c func(Message)) {
 	l := make(map[string]string)
 
 	if c != nil {
-		a.callbacks[aid] = c
+		a.updateActionCallback(aid, c)
 	}
 
 	l["Action"] = "Login"
@@ -295,7 +331,7 @@ func (a *Asterisk) Originate(
 	o["Variable"] = strings.TrimRight(o["Variable"], ",")
 
 	if c != nil {
-		a.callbacks[o["ActionID"]] = c
+		a.updateActionCallback(aid, c)
 	}
 
 	a.SendAction(o, nil)
@@ -306,9 +342,11 @@ func (a *Asterisk) OriginateApp(
 	channel string, app string, data string, timeout string, callerId string, account string, async bool,
 	variable map[string]string, c func(Message)) {
 
+	aid := a.generateId()
+
 	o := map[string]string{
 		"Action":      "Originate",
-		"ActionID":    a.generateId(),
+		"ActionID":    aid,
 		"Channel":     channel,
 		"Application": app,
 		"Data":        data,
@@ -332,7 +370,7 @@ func (a *Asterisk) OriginateApp(
 	o["Variable"] = strings.TrimRight(o["Variable"], ",")
 
 	if c != nil {
-		a.callbacks[o["ActionID"]] = c
+		a.updateActionCallback(aid, c)
 	}
 
 	a.SendAction(o, nil)
@@ -341,14 +379,16 @@ func (a *Asterisk) OriginateApp(
 // Hangup, close a channel
 func (a *Asterisk) Hangup(channel string, c func(Message)) {
 
+	aid := a.generateId()
+
 	h := map[string]string{
 		"Action":   "Hangup",
-		"ActionID": a.generateId(),
+		"ActionID": aid,
 		"Channel":  channel,
 	}
 
 	if c != nil {
-		a.callbacks[h["ActionID"]] = c
+		a.updateActionCallback(aid, c)
 	}
 
 	a.SendAction(h, nil)
@@ -357,9 +397,11 @@ func (a *Asterisk) Hangup(channel string, c func(Message)) {
 // Redirect, move channel to different context
 func (a *Asterisk) Redirect(channel string, exten string, context string, priority string, c func(Message)) {
 
+	aid := a.generateId()
+
 	r := map[string]string{
 		"Action":   "Redirect",
-		"ActionID": a.generateId(),
+		"ActionID": aid,
 		"Channel":  channel,
 		"Exten":    exten,
 		"Context":  context,
@@ -367,7 +409,7 @@ func (a *Asterisk) Redirect(channel string, exten string, context string, priori
 	}
 
 	if c != nil {
-		a.callbacks[r["ActionID"]] = c
+		a.updateActionCallback(aid, c)
 	}
 
 	a.SendAction(r, nil)
@@ -376,13 +418,15 @@ func (a *Asterisk) Redirect(channel string, exten string, context string, priori
 // Logoff, finishing working with AMI (will close net.Conn)
 func (a *Asterisk) Logoff(c func(Message)) {
 
+	aid := a.generateId()
+
 	l := map[string]string{
 		"Action":   "Logoff",
-		"ActionID": a.generateId(),
+		"ActionID": aid,
 	}
 
 	if c != nil {
-		a.callbacks[l["ActionID"]] = c
+		a.updateActionCallback(aid, c)
 	}
 
 	a.SendAction(l, nil)
@@ -391,11 +435,13 @@ func (a *Asterisk) Logoff(c func(Message)) {
 // RegisterHandler, register handle function for specific Asterisk event
 func (a *Asterisk) RegisterHandler(event string, c func(Message)) {
 
-	a.eventHandlers[event] = c
+	if c != nil {
+		a.updateEventCallback(event, c)
+	}
 }
 
 // UnregisterHandler, remove previously registered event handler
 func (a *Asterisk) UnregisterHandler(event string) {
 
-	delete(a.eventHandlers, event)
+	a.updateEventCallback(event, nil)
 }
