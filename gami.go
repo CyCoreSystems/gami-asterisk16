@@ -56,7 +56,6 @@ package gami
 //
 // TODO:
 //  - implement multipacket response parsing (CoreShowChannels, SIPpeers)
-//  - implement socket error handling
 
 import (
 	"bufio"
@@ -89,6 +88,7 @@ type Asterisk struct {
 	cMutex        *sync.RWMutex            // mutex for callbacks
 	eventHandlers map[string]func(Message) // map for event callbacks
 	eMutex        *sync.RWMutex            // mutex for events
+	necb          *func(error)             // network error callback
 	hostname      string                   // hostname stored for generate ActionID
 	id            int                      // integer indentificator for action
 }
@@ -177,6 +177,12 @@ func (a *Asterisk) Handle() (err error) {
 
 			if err != nil {
 				quit <- 1
+
+				cb := *a.necb
+				if cb != nil {
+					defer cb(err)
+				}
+
 				return
 			}
 		}
@@ -198,13 +204,13 @@ func (a *Asterisk) Handle() (err error) {
 					p = []string{}      // initiate new packet buffer
 
 					if f, ok := a.callbacks[m["ActionID"]]; ok {
-						f(m)
+						go f(m)
 						a.updateActionCallback(m["ActionID"], nil)
 					}
 
 					if v, vok := m["Event"]; vok {
 						if f, fok := a.eventHandlers[v]; fok {
-							f(m)
+							go f(m)
 						}
 					}
 
@@ -228,6 +234,12 @@ func (a *Asterisk) Handle() (err error) {
 	}()
 
 	return
+}
+
+// OnNetError, add callback, executes on network error
+func (a *Asterisk) OnNetError(c func(error)) {
+
+	a.necb = &c
 }
 
 // send, generic send packet to Asterisk
