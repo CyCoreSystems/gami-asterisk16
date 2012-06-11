@@ -20,21 +20,21 @@
       return
   }
 
- Checking if login successful (package not auto logins!):
+ Login to Asterisk (package not auto logins!):
 
-  eh := make(chan error)
-  handleLogin := func(m gami.Message) {
-      if m["Response"] == "Success" { eh <- nil } else { eh <- fmt.Errorf("%#v\n", m) }
-  }
-
-  a.Login("username", "password", handleLogin)
-  loginErr := <- eh
+  loginErr := a.Login("username", "password")
   if loginErr != nil { <error handling> }
 
- Placing simple command:
+ Placing a call:
+
+  a.OriginateApp("SIP/myphone", "Playback", "hello-world, 
+    "", "User <myphone>", "", true, nil, nil) // call to SIP/myphone and play hello-world to it
+
+ Placing simple (any other too) command:
 
   ping := map[string]string { "Action":"Ping", }
-  a.SendAction(ping, nil)
+  a.SendAction(ping, nil) // SendAction sends raw Asterisk command to AMI,
+                          // it can be used for login with custom handle function
 
  Event handlers:
 
@@ -57,7 +57,6 @@ package gami
 // TODO:
 //  - implement multipacket response parsing (CoreShowChannels, SIPpeers)
 //  - implement socket error handling
-//  - cheking if logined to server
 
 import (
 	"bufio"
@@ -137,7 +136,6 @@ func (a *Asterisk) updateActionCallback(key string, c func(Message)) {
 func (a *Asterisk) updateEventCallback(key string, c func(Message)) {
 
 	a.eMutex.Lock()
-
 	defer a.eMutex.Unlock()
 
 	if c == nil {
@@ -171,7 +169,7 @@ func (a *Asterisk) Handle() (err error) {
 	}
 
 	// reads data from connection and send it to 
-	// handler channel (skipping errors)
+	// handler channel (exit on error)
 	go func() {
 		for {
 			data, err := r.ReadString('\n')
@@ -238,10 +236,6 @@ func (a *Asterisk) send(p string) (err error) {
 	p += T
 	_, err = fmt.Fprintf(a.C, p)
 
-	if err != nil {
-		panic(err)
-	}
-
 	return
 }
 
@@ -283,14 +277,21 @@ func (a *Asterisk) SendAction(p map[string]string, c func(Message)) {
 }
 
 // Login, login to AMI
-func (a *Asterisk) Login(user string, password string, c func(Message)) {
+func (a *Asterisk) Login(user string, password string) error {
+
+	lhc := make(chan error)
+	lh := func(m Message) {
+		if m["Response"] == "Success" {
+			lhc <- nil
+		} else {
+			lhc <- fmt.Errorf("%s", m["Message"])
+		}
+	}
 
 	aid := a.generateId()
 	l := make(map[string]string)
 
-	if c != nil {
-		a.updateActionCallback(aid, c)
-	}
+	a.updateActionCallback(aid, lh)
 
 	l["Action"] = "Login"
 	l["ActionID"] = aid
@@ -298,6 +299,8 @@ func (a *Asterisk) Login(user string, password string, c func(Message)) {
 	l["Secret"] = password
 
 	a.SendAction(l, nil)
+
+	return <-lhc
 }
 
 // Originate, place call
