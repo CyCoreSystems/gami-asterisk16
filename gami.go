@@ -91,6 +91,7 @@ type Asterisk struct {
 	necb          *func(error)             // network error callback
 	hostname      string                   // hostname stored for generate ActionID
 	id            int                      // integer indentificator for action
+	idMu          *sync.RWMutex
 }
 
 // parseMessage, asterisk Message parser from string array
@@ -154,6 +155,7 @@ func (a *Asterisk) Handle() (err error) {
 	a.eventHandlers = make(map[string]func(Message))
 	a.cMutex = &sync.RWMutex{}
 	a.eMutex = &sync.RWMutex{}
+	a.idMu = &sync.RWMutex{}
 
 	quit := make(chan int)
 
@@ -255,9 +257,8 @@ func (a *Asterisk) send(p string) (err error) {
 func (a *Asterisk) generateId() (id string) {
 
 	id = a.hostname + "-" + fmt.Sprint(a.id)
-	s := sync.RWMutex{}
-	s.Lock()
-	defer s.Unlock()
+	a.idMu.Lock()
+	defer a.idMu.Unlock()
 
 	a.id++
 	return
