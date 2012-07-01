@@ -1,299 +1,180 @@
-/* 
- Package gami implements simple Asterisk Manager Interface library.
-
- It's not handle any network layer, just parsing or creating packets
- and runs callback for it (if registered).
-
- Start working:
-
-  conn, err := net.Dial("tcp", "astserver:5038")
-  if err != nil {
-      fmt.Fprintf(os.Stderr, "Can't connect " + err.Error() + "\n")
-      return
-  }
-
-  var a gami.Asterisk
-  a = gami.Asterisk{C:conn, Debug:true, Writer:os.Stdout} // will print all packets to stdout
-  err = a.Handle() // preparing and starting reader and parser goroutines
-  if err != nil {
-      <error handling>
-      return
-  }
-
- Login to Asterisk (package not auto logins!):
-
-  loginErr := a.Login("username", "password")
-  if loginErr != nil { <error handling> }
-
- Placing a call:
-
-  a.OriginateApp("SIP/myphone", "Playback", "hello-world, 
-    "", "User <myphone>", "", true, nil, nil) // call to SIP/myphone and play hello-world to it
-
- Placing simple (any other too) command:
-
-  ping := map[string]string { "Action":"Ping", }
-  a.SendAction(ping, nil) // SendAction sends raw Asterisk command to AMI,
-                          // it can be used for login with custom handle function
-
- Event handlers:
-
-  hangupHandler := func(m gami.Message) {
-    fmt.Printf("Hangup event received for channel %s\n", m["Channel"])
-  }
-
-  a.RegisterHandler("Hangup", hangupHandler)
-  ...
-  a.UnregisterHandler("Hangup")
-
- Finishing working:
-
-  a.Logoff(nil)
-*/
 package gami
-
-// Author: Vasiliy Kovalenko <dev.boot@gmail.com>
-//
-// TODO:
-//  - implement multipacket response parsing (CoreShowChannels, SIPpeers)
 
 import (
 	"bufio"
+	"bytes"
 	"fmt"
-	"io"
 	"net"
 	"os"
-	"strings"
 	"sync"
 )
 
 const (
-	T       = "\r\n"            // packet terminator
-	C_T     = "--END COMMAND--" // command terminator
-	HOST    = "gami_host"       // if os.Hostname not successful will use this for actionid
-	O_TMOUT = "30000"           // originate timeout default value in ms
-	VER     = 0.1               // package version
+	_LINE_TERM    = "\r\n"            // packet line separator
+	_KEY_VAL_TERM = ":"               // header value separator
+	_READ_BUF     = 512               // buffer size for socket reader
+	_CMD_END      = "--END COMMAND--" // Asterisk command data end
+	_HOST         = "gami"            // default host value
+	ORIG_TMOUT    = 30000             // Originate timeout
+	VER           = 0.2
 )
 
-// asterisk Message, response for command or event
+var (
+	_PT_BYTES = []byte(_LINE_TERM + _LINE_TERM) // packet separator
+)
+
+// basic Asterisk message
 type Message map[string]string
 
-// main struct for interacting to module
-type Asterisk struct {
-	C             net.Conn                 // network connection
-	Debug         bool                     // will print all message to Writer
-	Writer        io.Writer                // all messages from asterisk will come there if Debug is true
-	ch            chan string              // channel for interacting between read and parse goroutine
-	callbacks     map[string]func(Message) // map for callback functions
-	cMutex        *sync.RWMutex            // mutex for callbacks
-	eventHandlers map[string]func(Message) // map for event callbacks
-	eMutex        *sync.RWMutex            // mutex for events
-	necb          *func(error)             // network error callback
-	hostname      string                   // hostname stored for generate ActionID
-	id            int                      // integer indentificator for action
-	idMu          *sync.RWMutex
+// action id generator
+type Aid struct {
+	host string
+	id   int
+	mu   *sync.RWMutex
 }
 
-// parseMessage, asterisk Message parser from string array
-func parseMessage(s []string) (m Message) {
+// NewAid, Aid factory
+func NewAid() *Aid {
 
-	m = make(Message)
+	var err error
+	a := &Aid{}
+	a.mu = &sync.RWMutex{}
 
-	for _, l := range s {
-
-		res := strings.Split(l, ":")
-		if len(res) == 1 {
-			if l != C_T+T {
-				m["CmdData"] = strings.Join([]string{m["CmdData"], l}, "")
-			}
-			continue
-		}
-
-		f := strings.TrimSpace(res[0])
-		v := strings.Trim(res[1], "\r\n")
-		v = strings.TrimSpace(v)
-		m[f] = v
+	if a.host, err = os.Hostname(); err != nil {
+		a.host = _HOST
 	}
 
-	return
+	return a
 }
 
-// updateActionCallback, add, remove or update callback for action
-// if c == nil will remove callback, otherways replace or add
-func (a *Asterisk) updateActionCallback(key string, c func(Message)) {
+// GenerateId, generate new action id
+func (a *Aid) Generate() string {
 
-	a.cMutex.Lock()
-	defer a.cMutex.Unlock()
-
-	if c == nil {
-		delete(a.callbacks, key)
-		return
-	}
-
-	a.callbacks[key] = c
-}
-
-// updateEventCallback, add, remove or update callback for event
-func (a *Asterisk) updateEventCallback(key string, c func(Message)) {
-
-	a.eMutex.Lock()
-	defer a.eMutex.Unlock()
-
-	if c == nil {
-		delete(a.eventHandlers, key)
-		return
-	}
-
-	a.eventHandlers[key] = c
-}
-
-// Handle, preparing gami for working with Asterisk
-func (a *Asterisk) Handle() (err error) {
-
-	a.ch = make(chan string, 20)
-	a.callbacks = make(map[string]func(Message))
-	a.eventHandlers = make(map[string]func(Message))
-	a.cMutex = &sync.RWMutex{}
-	a.eMutex = &sync.RWMutex{}
-	a.idMu = &sync.RWMutex{}
-
-	quit := make(chan int)
-
-	if a.hostname, err = os.Hostname(); err != nil {
-		a.hostname = HOST
-	}
-
-	// skipping version string
-	r := bufio.NewReader(a.C)
-	_, err = r.ReadString('\n')
-	if err != nil {
-		return
-	}
-
-	// reads data from connection and send it to 
-	// handler channel (exit on error)
-	go func() {
-		for {
-			data, err := r.ReadString('\n')
-			a.ch <- data
-
-			if err != nil {
-				quit <- 1
-
-				cb := *a.necb
-				if cb != nil {
-					defer cb(err)
-				}
-
-				return
-			}
-		}
-	}()
-
-	// reads data from channel, collecting packet
-	// after parsing it and execute callback if exists
-	go func() {
-
-		p := []string{}
-
-		for {
-			select {
-			case d := <-a.ch:
-
-				if d == T { // received packet terminator
-					var m Message       // initiate message struct, simple map wrapper
-					m = parseMessage(p) // parsing message
-					p = []string{}      // initiate new packet buffer
-
-					if f, ok := a.callbacks[m["ActionID"]]; ok {
-						go f(m)
-						a.updateActionCallback(m["ActionID"], nil)
-					}
-
-					if v, vok := m["Event"]; vok {
-						if f, fok := a.eventHandlers[v]; fok {
-							go f(m)
-						}
-					}
-
-					if a.Debug {
-						fmt.Fprintf(a.Writer, "%#v\n", m)
-					}
-
-				} else if d == "" { // if empty line skip
-					continue
-
-				} else { // adding new data to packet buffer
-					p = append(p, d)
-
-				}
-
-			case <-quit:
-
-				return
-			}
-		}
-	}()
-
-	return
-}
-
-// OnNetError, add callback, executes on network error
-func (a *Asterisk) OnNetError(c func(error)) {
-
-	a.necb = &c
-}
-
-// send, generic send packet to Asterisk
-func (a *Asterisk) send(p string) (err error) {
-
-	p += T
-	_, err = fmt.Fprintf(a.C, p)
-
-	return
-}
-
-// generateId, generate aciton id for commands
-func (a *Asterisk) generateId() (id string) {
-
-	id = a.hostname + "-" + fmt.Sprint(a.id)
-	a.idMu.Lock()
-	defer a.idMu.Unlock()
-
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	a.id++
-	return
+	return a.host + "-" + fmt.Sprint(a.id)
 }
 
-// SendAction, sends any action to AMI, if action is command, example,
-// "core show channels" all output data (with newlines and tabs) will be stored in Message field CmdData,
-// except end string
-func (a *Asterisk) SendAction(p map[string]string, c func(Message)) {
+// callback function storage
+type cbList struct {
+	mu *sync.RWMutex
+	f  map[string]*func(Message)
+	sd map[string]bool // callback will self delete (used for multi-message responses)
+}
 
-	cmd := ""
+// set, setting handle function for specific action id|event (will overwrite current if present)
+func (cbl *cbList) set(key string, f *func(Message), sd bool) {
 
-	if v, ok := p["ActionID"]; !ok || v == "" { // if no ActionID will generate
-		p["ActionID"] = a.generateId()
-
-	}
-
-	if c != nil {
-		a.updateActionCallback(p["ActionID"], c)
-	}
-
-	for k, v := range p {
-		cmd += k + ":" + v + T
-	}
-
-	if err := a.send(cmd); err != nil {
-		fmt.Printf("Error %s\n", err.Error())
+	cbl.mu.Lock()
+	defer cbl.mu.Unlock()
+	cbl.f[key] = f
+	if sd {
+		cbl.sd[key] = true
 	}
 }
 
-// Login, login to AMI
-func (a *Asterisk) Login(user string, password string) error {
+// del, deleting callback for specific action id|event
+func (cbl *cbList) del(key string) {
+
+	cbl.mu.Lock()
+	defer cbl.mu.Unlock()
+	delete(cbl.f, key)
+	delete(cbl.sd, key)
+}
+
+// get, returns function for specific action id/event
+func (cbl *cbList) get(key string) (*func(Message), bool) {
+
+	cbl.mu.RLock()
+	defer cbl.mu.RUnlock()
+	return cbl.f[key], cbl.sd[key]
+}
+
+// Originate, struct used in Originate command
+// if pointed Context and Application, Context has higher priority
+type Originate struct {
+	Channel  string // channel to which originate
+	Context  string // context to move after originate success
+	Exten    string // exten to move after originate success
+	Priority string // priority to move after originate success
+	Timeout  int    // originate timeout ms
+	CallerID string // caller identification string
+	Account  string // used for CDR
+
+	Application string // application to execute after successful originate
+	Data        string // data passed to application
+
+	Async bool // asynchronous call
+}
+
+// NewOriginate, Originate default values constructor (to context)
+func NewOriginate(channel, context, exten, priority string) *Originate {
+	return &Originate{
+		Channel:  channel,
+		Context:  context,
+		Exten:    exten,
+		Priority: priority,
+		Timeout:  ORIG_TMOUT,
+		Async:    false,
+	}
+}
+
+// NewOriginateApp, constructor for originate to application
+func NewOriginateApp(channel, app, data string) *Originate {
+	return &Originate{
+		Channel:     channel,
+		Timeout:     ORIG_TMOUT,
+		Application: app,
+		Data:        data,
+		Async:       false,
+	}
+}
+
+// main working entity
+type Asterisk struct {
+	conn           *net.Conn      // network connection to Asterisk
+	actionHandlers *cbList        // action response handle functions
+	eventHandlers  *cbList        // event handle functions
+	defaultHandler *func(Message) // default handler for all Asterisk messages, useful for debugging
+	netErrHandler  *func(error)   // network error handle function
+	aid            *Aid           // action id
+	authorized     bool           // is successful logined to AMI
+}
+
+// NewAsterisk, Asterisk factory
+func NewAsterisk(conn *net.Conn, f *func(error)) *Asterisk {
+
+	return &Asterisk{
+		conn: conn,
+		actionHandlers: &cbList{
+			&sync.RWMutex{},
+			make(map[string]*func(Message)),
+			make(map[string]bool),
+		},
+		eventHandlers: &cbList{
+			&sync.RWMutex{},
+			make(map[string]*func(Message)),
+			make(map[string]bool),
+		},
+		aid:           NewAid(),
+		netErrHandler: f,
+	}
+}
+
+// DefaultHandler, set default handler for all Asterisk messages
+func (a *Asterisk) DefaultHandler(f *func(Message)) {
+
+	a.defaultHandler = f
+}
+
+// Login, logins to AMI and starts read dispatcher
+func (a *Asterisk) Login(login string, password string) error {
+
+	go a.readDispatcher()
 
 	lhc := make(chan error)
-	lh := func(m Message) {
+	lhf := func(m Message) {
 		if m["Response"] == "Success" {
 			lhc <- nil
 		} else {
@@ -301,165 +182,262 @@ func (a *Asterisk) Login(user string, password string) error {
 		}
 	}
 
-	aid := a.generateId()
-	l := make(map[string]string)
+	aid := a.aid.Generate()
+	a.actionHandlers.set(aid, &lhf, false)
 
-	a.updateActionCallback(aid, lh)
-
-	l["Action"] = "Login"
-	l["ActionID"] = aid
-	l["Username"] = user
-	l["Secret"] = password
-
-	a.SendAction(l, nil)
-
-	return <-lhc
-}
-
-// Originate, place call
-func (a *Asterisk) Originate(
-	channel string, exten string, context string, priority string, timeout string, callerId string,
-	account string, async bool, variable map[string]string, c func(Message)) {
-
-	aid := a.generateId()
-	o := map[string]string{
-		"Action":   "Originate",
+	m := Message{
+		"Action":   "Login",
+		"Username": login,
+		"Secret":   password,
 		"ActionID": aid,
-		"Channel":  channel,
-		"Exten":    exten,
-		"Context":  context,
-		"Priority": priority,
-		"Timeout":  timeout,
-		"CallerID": callerId,
-		"Account":  account,
+	}
+	a.send(m)
+
+	err := <-lhc
+
+	if err != nil {
+		return err
 	}
 
-	if timeout == "" {
-		o["Timeout"] = O_TMOUT
-	}
+	a.authorized = true
 
-	if async {
-		o["Async"] = "True"
-	}
-
-	for k, v := range variable {
-		o["Variable"] += k + "=" + v + ","
-	}
-
-	o["Variable"] = strings.TrimRight(o["Variable"], ",")
-
-	if c != nil {
-		a.updateActionCallback(aid, c)
-	}
-
-	a.SendAction(o, nil)
+	return nil
 }
 
-// OriginateApp, place call and goes to application
-func (a *Asterisk) OriginateApp(
-	channel string, app string, data string, timeout string, callerId string, account string, async bool,
-	variable map[string]string, c func(Message)) {
+// SendAction, universal action send
+func (a *Asterisk) SendAction(m Message, f *func(m Message)) error {
 
-	aid := a.generateId()
-
-	o := map[string]string{
-		"Action":      "Originate",
-		"ActionID":    aid,
-		"Channel":     channel,
-		"Application": app,
-		"Data":        data,
-		"Timeout":     timeout,
-		"CallerID":    callerId,
-		"Account":     account,
+	if !a.authorized {
+		return fmt.Errorf("Not authorized")
 	}
 
-	if timeout == "" {
-		o["Timeout"] = O_TMOUT
+	m["ActionID"] = a.aid.Generate()
+
+	if f != nil {
+		a.actionHandlers.set(m["ActionID"], f, false)
 	}
 
-	if async {
-		o["Async"] = "True"
-	}
-
-	for k, v := range variable {
-		o["Variable"] += k + "=" + v + ","
-	}
-
-	o["Variable"] = strings.TrimRight(o["Variable"], ",")
-
-	if c != nil {
-		a.updateActionCallback(aid, c)
-	}
-
-	a.SendAction(o, nil)
+	return a.send(m)
 }
 
-// Hangup, close a channel
-func (a *Asterisk) Hangup(channel string, c func(Message)) {
+// HoldCallbackAction, send action with callback which deletes itself (used for multi-line responses)
+// IMPORTANT: callback function must delete itself by own
+func (a *Asterisk) HoldCallbackAction(m Message, f *func(m Message)) error {
 
-	aid := a.generateId()
-
-	h := map[string]string{
-		"Action":   "Hangup",
-		"ActionID": aid,
-		"Channel":  channel,
+	if !a.authorized {
+		return fmt.Errorf("Not authorized")
 	}
 
-	if c != nil {
-		a.updateActionCallback(aid, c)
+	m["ActionID"] = a.aid.Generate()
+
+	if f == nil {
+		return fmt.Errorf("Use SendAction with nil callback!")
 	}
 
-	a.SendAction(h, nil)
+	a.actionHandlers.set(m["ActionID"], f, true)
+
+	return a.send(m)
 }
 
-// Redirect, move channel to different context
-func (a *Asterisk) Redirect(channel string, exten string, context string, priority string, c func(Message)) {
+// DelCallback, delete action callback (used by self-delete callbacks)
+func (a *Asterisk) DelCallback(m Message) {
 
-	aid := a.generateId()
+	a.actionHandlers.del(m["ActionID"])
+}
 
-	r := map[string]string{
+// Hangup, hangup Asterisk channel
+func (a Asterisk) Hangup(channel string, f *func(Message)) error {
+
+	m := Message{
+		"Action":  "Hangup",
+		"Channel": channel,
+	}
+
+	return a.SendAction(m, f)
+}
+
+// Redirect, redirect Asterisk channel
+func (a Asterisk) Redirect(channel string, context string, exten string, priority string, f *func(Message)) error {
+
+	m := Message{
 		"Action":   "Redirect",
-		"ActionID": aid,
 		"Channel":  channel,
-		"Exten":    exten,
 		"Context":  context,
+		"Exten":    exten,
 		"Priority": priority,
 	}
 
-	if c != nil {
-		a.updateActionCallback(aid, c)
-	}
-
-	a.SendAction(r, nil)
+	return a.SendAction(m, f)
 }
 
-// Logoff, finishing working with AMI (will close net.Conn)
-func (a *Asterisk) Logoff(c func(Message)) {
+// Logoff, logoff from AMI
+func (a Asterisk) Logoff() error {
 
-	aid := a.generateId()
-
-	l := map[string]string{
-		"Action":   "Logoff",
-		"ActionID": aid,
+	m := Message{
+		"Action": "Logoff",
 	}
 
-	if c != nil {
-		a.updateActionCallback(aid, c)
-	}
-
-	a.SendAction(l, nil)
+	return a.SendAction(m, nil)
 }
 
-// RegisterHandler, register handle function for specific Asterisk event
-func (a *Asterisk) RegisterHandler(event string, c func(Message)) {
+// Originate, make a call
+func (a *Asterisk) Originate(o *Originate, vars map[string]string, f *func(Message)) error {
 
-	if c != nil {
-		a.updateEventCallback(event, c)
+	m := Message{
+		"Action":   "Originate",
+		"Channel":  o.Channel,
+		"Account":  o.Account,
+		"Timeout":  fmt.Sprint(o.Timeout),
+		"CallerID": o.CallerID,
 	}
+
+	if o.Async {
+		m["Async"] = "yes"
+	}
+
+	if o.Context == "" {
+		m["Application"] = o.Application
+		m["Data"] = o.Data
+	} else {
+		m["Context"] = o.Context
+		m["Exten"] = o.Exten
+		m["Priority"] = o.Priority
+	}
+
+	if vars != nil {
+		var vl string
+
+		for k, v := range vars {
+			vl += k + "=" + v + ","
+		}
+
+		m["Variable"] = vl[:len(vl)-1]
+	}
+
+	return a.SendAction(m, f)
 }
 
-// UnregisterHandler, remove previously registered event handler
+// RegisterHandler, register callback for Asterisk event (one handler per event)
+// return err if handler already exists
+func (a *Asterisk) RegisterHandler(event string, f *func(m Message)) error {
+
+	if f, _ := a.eventHandlers.get(event); f != nil {
+		return fmt.Errorf("Handler already exist for event %s", event)
+	}
+
+	a.eventHandlers.set(event, f, false)
+
+	return nil
+}
+
+// UnregisterHandler, deregister callback for event
 func (a *Asterisk) UnregisterHandler(event string) {
+	a.eventHandlers.del(event)
+}
 
-	a.updateEventCallback(event, nil)
+// send, send Message to socket
+func (a *Asterisk) send(m Message) error {
+
+	buf := bytes.NewBufferString("")
+
+	for k, v := range m {
+		buf.Write([]byte(k))
+		buf.Write([]byte(_KEY_VAL_TERM))
+		buf.Write([]byte(v))
+		buf.Write([]byte(_LINE_TERM))
+	}
+	buf.Write([]byte(_LINE_TERM))
+
+	if wrb, err := (*a.conn).Write(buf.Bytes()); wrb != buf.Len() || err != nil {
+		if err != nil {
+			return err
+		}
+		return fmt.Errorf("Not fully writed packet to output stream\n")
+	}
+
+	return nil
+}
+
+// readDispatcher, reads data from socket and builds messages
+func (a *Asterisk) readDispatcher() {
+
+	r := bufio.NewReader(*a.conn)
+	pbuf := bytes.NewBufferString("") // data buffer
+	buf := make([]byte, _READ_BUF)    // read buffer
+
+	for {
+		rc, err := r.Read(buf)
+
+		if err != nil { // network error
+			a.authorized = false // unauth
+
+			if a.netErrHandler != nil { // run network error callback
+				(*a.netErrHandler)(err)
+			}
+			return
+		}
+
+		wb, err := pbuf.Write(buf[:rc])
+
+		if err != nil || wb != rc { // can't write to data buffer, just skip
+			continue
+		}
+
+		// while has end of packet symbols in buffer
+		for pos := bytes.Index(pbuf.Bytes(), _PT_BYTES); pos != -1; pos = bytes.Index(pbuf.Bytes(), _PT_BYTES) {
+
+			bp := make([]byte, pos+len(_PT_BYTES))
+			r, err := pbuf.Read(bp)                    // reading packet to separate puffer
+			if err != nil || r != pos+len(_PT_BYTES) { // reading problems, just skip
+				continue
+			}
+
+			m := make(Message)
+
+			// splitting packet by line separator
+			for _, line := range bytes.Split(bp, []byte(_LINE_TERM)) {
+
+				// empty line
+				if len(line) == 0 {
+					continue
+				}
+
+				kvl := bytes.Split(line, []byte(_KEY_VAL_TERM))
+
+				// not standard header
+				if len(kvl) == 1 {
+					if string(line) != _CMD_END {
+						m["CmdData"] += string(line)
+					}
+					continue
+				}
+
+				k := bytes.TrimSpace(kvl[0])
+				v := bytes.TrimSpace(kvl[1])
+				m[string(k)] = string(v)
+			}
+
+			// if has ActionID and has callback run it and delete
+			if v, vok := m["ActionID"]; vok {
+				if f, sd := a.actionHandlers.get(v); f != nil {
+					go (*f)(m)
+					if !sd { // will never remove "self-delete" callbacks
+						a.actionHandlers.del(v)
+					}
+				}
+			}
+
+			// if Event and has callback run it
+			if v, vok := m["Event"]; vok {
+				if f, _ := a.eventHandlers.get(v); f != nil {
+					go (*f)(m)
+				}
+			}
+
+			// run default handler if not nil
+			if a.defaultHandler != nil {
+				go (*a.defaultHandler)(m)
+			}
+		}
+	}
 }
