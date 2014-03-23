@@ -335,6 +335,212 @@ func (a *Asterisk) UnregisterHandler(event string) {
 	a.eventHandlers.del(event)
 }
 
+// Bridge, bridge two channels already in the PBX
+func (a *Asterisk) Bridge(chan1, chan2 string, tone bool, f *func(Message)) error {
+
+	t := "no"
+	if tone {
+		t = "yes"
+	}
+
+	m := Message{
+		"Action":   "Bridge",
+		"Channel1": chan1,
+		"Channel2": chan2,
+		"Tone":     t,
+	}
+
+	return a.SendAction(m, f)
+}
+
+// Command, execute Asterisk CLI Command
+func (a *Asterisk) Command(cmd string, f *func(Message)) error {
+	m := Message{
+		"Action":  "Command",
+		"Command": cmd,
+	}
+
+	return a.SendAction(m, f)
+}
+
+// ConfbridgeList, list participants in a conference (generates multimessage response)
+func (a *Asterisk) ConfbridgeList(conference string, f *func(Message)) error {
+	m := Message{
+		"Action":     "ConfbridgeList",
+		"Conference": conference,
+	}
+
+	return a.SendAction(m, f)
+}
+
+// GetConfbridgeList, returns conference participants, blocks untill end
+func (a *Asterisk) GetConfbridgeList(conference string) ([]Message, error) {
+	m := Message{
+		"Action":     "ConfbridgeList",
+		"Conference": conference,
+	}
+
+	ml := []Message{}
+	mc := make(chan []Message)
+
+	clj := func(m Message) {
+		if m["Event"] == "ConfbridgeListComplete" && m["EventList"] == "Complete" ||
+			m["Response"] == "Error" {
+			a.DelCallback(m)
+			mc <- ml
+		}
+		if m["EventList"] == "start" {
+			return
+		}
+		ml = append(ml, m)
+	}
+
+	err := a.HoldCallbackAction(m, &clj)
+
+	if err != nil {
+		return nil, err
+	}
+
+	return <-mc, nil
+}
+
+// ConfbridgeKick, kick a Confbridge user
+func (a *Asterisk) ConfbridgeKick(conf, chann string, f *func(Message)) error {
+	m := Message{
+		"Action":     "ConfbridgeKick",
+		"Conference": conf,
+		"Channel":    chann,
+	}
+
+	return a.SendAction(m, f)
+}
+
+// ConfbridgeToggleMute, mute/unmute a Confbridge user
+func (a *Asterisk) ConfbridgeToggleMute(conf, chann string, mute bool, f *func(Message)) error {
+	m := Message{
+		"Conference": conf,
+		"Channel":    chann,
+	}
+
+	if mute {
+		m["Action"] = "ConfbridgeMute"
+	} else {
+		m["Action"] = "ConfbridgeUnmute"
+	}
+
+	return a.SendAction(m, f)
+}
+
+// ConfbridgeStartRecord, start conference record
+func (a *Asterisk) ConfbridgeStartRecord(conf, file string, f *func(Message)) error {
+
+	m := Message{
+		"Action":     "ConfbridgeStartRecord",
+		"Conference": conf,
+	}
+
+	if file != "" {
+		m["RecordFile"] = file
+	}
+
+	return a.SendAction(m, f)
+}
+
+// ConfbridgeStopRecord, stop conference record
+func (a *Asterisk) ConfbridgeStopRecord(conf string, f *func(Message)) error {
+	m := Message{
+		"Action":     "ConfbridgeStopRecord",
+		"Conference": conf,
+	}
+
+	return a.SendAction(m, f)
+}
+
+// MeetmeList, list participants in a MeetMe conference (generates multimessage response)
+// if conference empty string will return for all conferences
+func (a *Asterisk) MeetmeList(conference string, f *func(Message)) error {
+	m := Message{
+		"Action": "MeetmeList",
+	}
+
+	if conference != "" {
+		m["Conference"] = conference
+	}
+
+	return a.SendAction(m, f)
+}
+
+// GetMeetmeList, returns MeetMe conference participants, blocks untill end
+func (a *Asterisk) GetMeetmeList(conference string) ([]Message, error) {
+	m := Message{
+		"Action": "MeetmeList",
+	}
+
+	if conference != "" {
+		m["Conference"] = conference
+	}
+
+	ml := []Message{}
+	mc := make(chan []Message)
+
+	clj := func(m Message) {
+		if m["Event"] == "MeetmeListComplete" && m["EventList"] == "Complete" ||
+			m["Response"] == "Error" {
+			a.DelCallback(m)
+			mc <- ml
+		}
+		if m["EventList"] == "start" {
+			return
+		}
+		ml = append(ml, m)
+	}
+
+	err := a.HoldCallbackAction(m, &clj)
+
+	if err != nil {
+		return nil, err
+	}
+
+	return <-mc, nil
+}
+
+// ModuleLoad, loads, unloads or reloads an Asterisk module in a running system
+func (a *Asterisk) ModuleLoad(module, tload string, f *func(Message)) error {
+
+	m := Message{
+		"Action":   "ModuleLoad",
+		"LoadType": tload,
+		"Module":   module,
+	}
+
+	return a.SendAction(m, f)
+}
+
+// Reload, reload Asterisk module
+func (a *Asterisk) Reaload(module string, f *func(Message)) error {
+
+	m := Message{
+		"Action": "Reload",
+		"Module": module,
+	}
+
+	return a.SendAction(m, f)
+}
+
+// UserEvent, send an arbitrary event
+func (a *Asterisk) UserEvent(name string, headers map[string]string, f *func(Message)) error {
+	m := Message{
+		"Action":    "UserEvent",
+		"UserEvent": name,
+	}
+
+	for k, v := range headers {
+		m[k] = v
+	}
+
+	return a.SendAction(m, f)
+}
+
 // send, send Message to socket
 func (a *Asterisk) send(m Message) error {
 
