@@ -69,9 +69,7 @@ func (cbl *cbList) set(key string, f *func(Message), sd bool) {
 	cbl.mu.Lock()
 	defer cbl.mu.Unlock()
 	cbl.f[key] = f
-	if sd {
-		cbl.sd[key] = true
-	}
+	cbl.sd[key] = sd
 }
 
 // del, deleting callback for specific action id|event
