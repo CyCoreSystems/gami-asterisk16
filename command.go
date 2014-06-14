@@ -1,7 +1,21 @@
 package gami
 
 import (
+	"encoding/base64"
 	"fmt"
+)
+
+type ConfigAction string
+
+const (
+	ConfNewCat    ConfigAction = "NewCat"
+	ConfRenameCat ConfigAction = "RenameCat"
+	ConfDelCat    ConfigAction = "DelCat"
+	ConfEmptyCat  ConfigAction = "EmptyCat"
+	ConfUpdate    ConfigAction = "Update"
+	ConfDelete    ConfigAction = "Delete"
+	ConfAppend    ConfigAction = "Append"
+	ConfInsert    ConfigAction = "Insert"
 )
 
 // DefaultHandler, set default handler for all Asterisk messages
@@ -378,6 +392,176 @@ func (a *Asterisk) UserEvent(name string, headers map[string]string, f *func(Mes
 
 	for k, v := range headers {
 		m[k] = v
+	}
+
+	return a.SendAction(m, f)
+}
+
+// DbGet, retrive data from Asterisk DB, response must be processed in f
+func (a *Asterisk) DbGet(family, key string, f *func(Message)) error {
+	m := Message{
+		"Action": "DBGet",
+		"Family": family,
+		"Key":    key,
+	}
+
+	return a.SendAction(m, f)
+}
+
+// DbPut, put data to Asterisk DB
+func (a *Asterisk) DbPut(family, key, value string, f *func(Message)) error {
+	m := Message{
+		"Action": "DBGet",
+		"Family": family,
+		"Key":    key,
+		"Value":  value,
+	}
+
+	return a.SendAction(m, f)
+}
+
+// DbDel, remove value from Asterisk DB
+func (a *Asterisk) DbDel(family, key string, f *func(Message)) error {
+	m := Message{
+		"Action": "DBDel",
+		"Family": family,
+		"Key":    key,
+	}
+
+	return a.SendAction(m, f)
+}
+
+// DbDelTree, remove family tree from Asterisk DB
+func (a *Asterisk) DbDelTree(family, key string, f *func(Message)) error {
+	m := Message{
+		"Action": "DBDelTree",
+		"Family": family,
+	}
+
+	if key != "" {
+		m["Key"] = key
+	}
+
+	return a.SendAction(m, f)
+}
+
+// MessageSend, send message (pjsip, sip, xmpp)
+func (a *Asterisk) MessageSend(to, from, body string, useBase64 bool, vars map[string]string, f *func(Message)) error {
+
+	m := Message{
+		"Action": "MessageSend",
+		"To":     to,
+		"From":   from,
+	}
+
+	if useBase64 {
+		m["Base64Body"] = base64.StdEncoding.EncodeToString([]byte(body))
+	} else {
+		m["Body"] = body
+	}
+
+	if vars != nil {
+		var vl string
+
+		for k, v := range vars {
+			vl += k + "=" + v + ","
+		}
+
+		m["Variable"] = vl[:len(vl)-1]
+	}
+
+	return a.SendAction(m, f)
+}
+
+// GetVar, get variable (response must be handled with callback function)
+func (a *Asterisk) GetVar(name, channel string, f *func(Message)) error {
+	m := Message{
+		"Action":   "GetVar",
+		"Variable": name,
+	}
+
+	if channel != "" {
+		m["Channel"] = channel
+	}
+
+	return a.SendAction(m, f)
+}
+
+// SetVar, set variable
+func (a *Asterisk) SetVar(name, value, channel string, f *func(Message)) error {
+	m := Message{
+		"Action":   "SetVar",
+		"Variable": name,
+		"Value":    value,
+	}
+
+	if channel != "" {
+		m["Channel"] = channel
+	}
+
+	return a.SendAction(m, f)
+}
+
+// CreateConfig, create empty Asterisk config
+func (a *Asterisk) CreateConfig(filename string, f *func(Message)) error {
+	m := Message{
+		"Action":   "CreateConfig",
+		"Filename": filename,
+	}
+
+	return a.SendAction(m, f)
+}
+
+// GetConfig, get Asterisk config content (category ignored for JSON), response should be handled in callback function
+func (a *Asterisk) GetConfig(filename, category string, json bool, f *func(Message)) error {
+	m := Message{
+		"Filename": filename,
+	}
+
+	if json {
+		m["Action"] = "GetConfigJSON"
+	} else {
+		m["Action"] = "GetConfig"
+		if category != "" {
+			m["Category"] = category
+		}
+	}
+
+	return a.SendAction(m, f)
+}
+
+type UpdateConfigAction struct {
+	Action   ConfigAction
+	Category string
+	Variable string
+	Value    string
+	Match    string
+	Line     string
+}
+
+// UpdateConfig, modify Asterisk config
+func (a *Asterisk) Updateconfig(srcFile, dstFile, reaload string, actions []UpdateConfigAction, f *func(Message)) error {
+
+	cnt := 0
+	m := Message{
+		"Action":      "UpdateConfig",
+		"SrcFilename": srcFile,
+		"DstFilename": dstFile,
+	}
+
+	if reaload != "" {
+		m["Reload"] = reaload
+	}
+
+	for _, v := range actions {
+		id := fmt.Sprintf("%06d", cnt)
+		m["Action-"+id] = string(v.Action)
+		m["Cat-"+id] = v.Category
+		m["Var-"+id] = v.Variable
+		m["Value-"+id] = v.Value
+		m["Match-"+id] = v.Match
+		m["Line-"+id] = v.Line
+		cnt++
 	}
 
 	return a.SendAction(m, f)
