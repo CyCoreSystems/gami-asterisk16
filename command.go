@@ -411,7 +411,7 @@ func (a *Asterisk) DbGet(family, key string, f *func(Message)) error {
 // DbPut, put data to Asterisk DB
 func (a *Asterisk) DbPut(family, key, value string, f *func(Message)) error {
 	m := Message{
-		"Action": "DBGet",
+		"Action": "DBPut",
 		"Family": family,
 		"Key":    key,
 		"Value":  value,
