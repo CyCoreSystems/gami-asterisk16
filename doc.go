@@ -82,5 +82,3 @@
 package gami
 
 // Author: Vasiliy Kovalenko <dev.boot@gmail.com>
-// TODO:
-//  - handling parse errors
