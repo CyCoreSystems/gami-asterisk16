@@ -1,3 +1,19 @@
+/*
+	Asterisk Gateway Interface support
+	Usage:
+		a := agi.NewAgi()
+		r := a.Answer()
+		checkErr(r.Err)
+		...
+		r = a.Noop("Hello New Chan")
+		...
+		r = a.SayAlpha("Hi")
+		...
+		r, status := a.ChannelStatus()
+		...
+		r.Hangup()
+
+*/
 package agi
 
 import (
@@ -9,6 +25,7 @@ import (
 	"strings"
 )
 
+// supported commands
 const (
 	Answer        Cmd = "ANSWER"
 	Noop          Cmd = "NOOP"
@@ -39,12 +56,14 @@ var (
 	_VarRe  *regexp.Regexp = regexp.MustCompile("^(\\d*)\\s*(.*)\\s*\\((\\S+)\\)")
 )
 
+// AGI command
 type Cmd string
 
+// response struct
 type Resp struct {
-	Payload string
-	Code    int
-	Err     error
+	Payload string // response body
+	Code    int    // response code
+	Err     error  // error if exist
 }
 
 func (r Resp) String() string {
@@ -55,12 +74,14 @@ func (r Resp) String() string {
 	return res + " }"
 }
 
+// main agi struct
 type Agi struct {
-	Env map[string]string
+	Env map[string]string // AGI environment variables
 	in  *bufio.Reader
 	out *bufio.Writer
 }
 
+// factory function
 func NewAgi() *Agi {
 	a := &Agi{
 		Env: make(map[string]string),
@@ -71,10 +92,12 @@ func NewAgi() *Agi {
 	return a
 }
 
+// answer channel
 func (a *Agi) Answer() *Resp {
 	return a.exec(Answer)
 }
 
+// return channel status
 func (a *Agi) ChannelStatus() (*Resp, int) {
 	r := a.exec(ChannelStatus)
 	statusRe := regexp.MustCompile("^\\d+\\s*result=(\\d+)")
@@ -87,14 +110,17 @@ func (a *Agi) ChannelStatus() (*Resp, int) {
 	return r, status
 }
 
+// NOOP
 func (a *Agi) Noop(args ...string) *Resp {
 	return a.exec(Noop, args...)
 }
 
+// handup channel
 func (a *Agi) Hangup() *Resp {
 	return a.exec(Hangup)
 }
 
+// wait for digit on channel, timeout in ms
 func (a *Agi) WaitForDigit(wait int) (*Resp, int) {
 	resp := a.exec(WaitForDigit, strconv.Itoa(wait))
 	if resp.Err != nil {
@@ -108,58 +134,72 @@ func (a *Agi) WaitForDigit(wait int) (*Resp, int) {
 	return resp, digit
 }
 
+// say datetime
 func (a *Agi) SayDateTime(unixtime int64, format string) *Resp {
 	return a.exec(SayDateTime, strconv.FormatInt(unixtime, 10), format)
 }
 
+// say digits
 func (a *Agi) SayDigits(num int) *Resp {
 	return a.exec(SayDigits, strconv.Itoa(num))
 }
 
+// say letters
 func (a *Agi) SayAlpha(str string) *Resp {
 	return a.exec(SayAlpha, str)
 }
 
+// get channel variable
 func (a *Agi) GetVariable(name string) (*Resp, string) {
 	return a.readVarFromResp(a.exec(GetVariable, name))
 }
 
+// set channel variable
 func (a *Agi) SetVariable(name, val string) *Resp {
 	return a.exec(SetVariable, name, val)
 }
 
+// set channel context
 func (a *Agi) SetContext(ctx string) *Resp {
 	return a.exec(SetContext, ctx)
 }
 
+// set channel extension
 func (a *Agi) SetExtension(ext string) *Resp {
 	return a.exec(SetExtension, ext)
 }
 
+// set channel priority for exten
 func (a *Agi) SetPripority(pr string) *Resp {
 	return a.exec(SetPripority, pr)
 }
 
+// basic command execute
 func (a *Agi) Exec(cmd Cmd, args ...string) *Resp {
 	return a.exec(cmd, args...)
 }
 
+// send text to channel, if support
 func (a *Agi) SendText(text string) *Resp {
 	return a.exec(SendText, text)
 }
 
+// delete key from DB
 func (a *Agi) DBDel(familiy, key string) *Resp {
 	return a.exec(DBDel, familiy, key)
 }
 
+// delete DB family
 func (a *Agi) DBDelTree(family string) *Resp {
 	return a.exec(DBDelTree, family)
 }
 
+// save value to DB
 func (a *Agi) DBPut(family, key, val string) *Resp {
 	return a.exec(DBPut, family, key, val)
 }
 
+// get value from DB
 func (a *Agi) DBGet(family, key string) (*Resp, string) {
 	return a.readVarFromResp(a.exec(DBGet, family, key))
 }
@@ -206,8 +246,17 @@ func (a *Agi) readResponse() *Resp {
 		code, _ := strconv.Atoi(groups[1])
 		resp.Code = code
 		resp.Payload = line
-		if code == 520 {
+		switch code {
+		case 520:
 			return a.read520(resp)
+		case 200:
+			return resp
+		case 510:
+			resp.Err = errors.New("Unknown command")
+			return resp
+		default:
+			resp.Err = errors.New("Unknown code")
+			return resp
 		}
 	} else {
 		resp.Err = errors.New("Unknown reponse: " + line)
