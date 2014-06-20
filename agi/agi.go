@@ -1,6 +1,8 @@
 /*
 	Asterisk Gateway Interface support
+
 	Usage:
+
 		a := agi.NewAgi()
 		r := a.Answer()
 		checkErr(r.Err)
