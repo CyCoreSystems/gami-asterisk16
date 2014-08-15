@@ -11,7 +11,7 @@ import (
 
 const (
 	_LINE_TERM    = "\r\n"            // packet line separator
-	_KEY_VAL_TERM = ":"               // header value separator
+	_KEY_VAL_TERM = ": "              // header value separator
 	_READ_BUF     = 512               // buffer size for socket reader
 	_CMD_END      = "--END COMMAND--" // Asterisk command data end
 	_HOST         = "gami"            // default host value
